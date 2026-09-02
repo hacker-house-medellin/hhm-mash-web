@@ -1,8 +1,6 @@
 use hhm_contracts::{valid_kind, PRODUCT};
 use hhm_mash_lambdas::{json_response, validate_get};
-use lambda_http::{
-    http::StatusCode, run, service_fn, tracing, Body, Error, Request, Response,
-};
+use lambda_http::{http::StatusCode, run, service_fn, tracing, Body, Error, Request, Response};
 use serde::Serialize;
 
 const EVENT_KIND: &str = "roster.export";

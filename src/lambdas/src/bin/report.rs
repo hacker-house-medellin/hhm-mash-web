@@ -1,8 +1,6 @@
 use hhm_contracts::{valid_kind, PRODUCT};
 use hhm_mash_lambdas::{html_response, validate_get};
-use lambda_http::{
-    http::StatusCode, run, service_fn, tracing, Body, Error, Request, Response,
-};
+use lambda_http::{http::StatusCode, run, service_fn, tracing, Body, Error, Request, Response};
 use maud::{html, DOCTYPE};
 
 const EVENT_KIND: &str = "occupancy.report";

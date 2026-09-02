@@ -76,9 +76,7 @@ fn parse_limit(
         return Ok(default_limit);
     };
 
-    let parsed = raw
-        .parse::<usize>()
-        .map_err(|_| LimitError::NotAnInteger)?;
+    let parsed = raw.parse::<usize>().map_err(|_| LimitError::NotAnInteger)?;
 
     if parsed == 0 || parsed > max_limit {
         return Err(LimitError::OutsideRange);
@@ -92,7 +90,10 @@ pub fn html_response(status: StatusCode, body: String) -> Result<Response<Body>,
         .status(status)
         .header("content-type", "text/html; charset=utf-8")
         .header("cache-control", "no-store")
-        .header("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'")
+        .header(
+            "content-security-policy",
+            "default-src 'none'; style-src 'unsafe-inline'",
+        )
         .header("referrer-policy", "no-referrer")
         .header("x-content-type-options", "nosniff")
         .body(Body::Text(body))?)
