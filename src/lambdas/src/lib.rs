@@ -12,22 +12,47 @@ pub struct RequestBounds {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LimitError {
-    NotAnInteger,
-    OutsideRange,
+pub enum ValidationError {
+    MethodNotAllowed,
+    PayloadTooLarge,
+    LimitNotInteger,
+    LimitOutsideRange,
+}
+
+impl ValidationError {
+    pub fn into_response(self) -> Response<Body> {
+        match self {
+            Self::MethodNotAllowed => problem(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+                "this Lambda accepts GET requests only",
+            ),
+            Self::PayloadTooLarge => problem(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                "request body exceeds the 64 KiB Lambda adapter limit",
+            ),
+            Self::LimitNotInteger => problem(
+                StatusCode::BAD_REQUEST,
+                "invalid_limit",
+                "limit must be an unsigned integer",
+            ),
+            Self::LimitOutsideRange => problem(
+                StatusCode::BAD_REQUEST,
+                "invalid_limit",
+                "limit is outside the accepted range",
+            ),
+        }
+    }
 }
 
 pub fn validate_get(
     request: &Request,
     default_limit: usize,
     max_limit: usize,
-) -> Result<RequestBounds, Response<Body>> {
+) -> Result<RequestBounds, ValidationError> {
     if request.method() != Method::GET {
-        return Err(problem(
-            StatusCode::METHOD_NOT_ALLOWED,
-            "method_not_allowed",
-            "this Lambda accepts GET requests only",
-        ));
+        return Err(ValidationError::MethodNotAllowed);
     }
 
     let body_len = match request.body() {
@@ -37,49 +62,35 @@ pub fn validate_get(
         _ => MAX_REQUEST_BYTES + 1,
     };
     if body_len > MAX_REQUEST_BYTES {
-        return Err(problem(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "payload_too_large",
-            "request body exceeds the 64 KiB Lambda adapter limit",
-        ));
+        return Err(ValidationError::PayloadTooLarge);
     }
 
     let raw_limit = request
         .query_string_parameters_ref()
         .and_then(|parameters| parameters.first("limit"));
 
-    match parse_limit(raw_limit, default_limit, max_limit) {
-        Ok(limit) => Ok(RequestBounds { limit }),
-        Err(LimitError::NotAnInteger) => Err(problem(
-            StatusCode::BAD_REQUEST,
-            "invalid_limit",
-            "limit must be an unsigned integer",
-        )),
-        Err(LimitError::OutsideRange) => Err(problem(
-            StatusCode::BAD_REQUEST,
-            "invalid_limit",
-            "limit is outside the accepted range",
-        )),
-    }
+    parse_limit(raw_limit, default_limit, max_limit).map(|limit| RequestBounds { limit })
 }
 
 fn parse_limit(
     raw: Option<&str>,
     default_limit: usize,
     max_limit: usize,
-) -> Result<usize, LimitError> {
+) -> Result<usize, ValidationError> {
     if max_limit == 0 || default_limit == 0 || default_limit > max_limit {
-        return Err(LimitError::OutsideRange);
+        return Err(ValidationError::LimitOutsideRange);
     }
 
     let Some(raw) = raw else {
         return Ok(default_limit);
     };
 
-    let parsed = raw.parse::<usize>().map_err(|_| LimitError::NotAnInteger)?;
+    let parsed = raw
+        .parse::<usize>()
+        .map_err(|_| ValidationError::LimitNotInteger)?;
 
     if parsed == 0 || parsed > max_limit {
-        return Err(LimitError::OutsideRange);
+        return Err(ValidationError::LimitOutsideRange);
     }
 
     Ok(parsed)
@@ -158,26 +169,26 @@ mod tests {
     fn rejects_invalid_limits() {
         assert_eq!(
             parse_limit(Some("not-a-number"), 25, 100),
-            Err(LimitError::NotAnInteger)
+            Err(ValidationError::LimitNotInteger)
         );
         assert_eq!(
             parse_limit(Some("0"), 25, 100),
-            Err(LimitError::OutsideRange)
+            Err(ValidationError::LimitOutsideRange)
         );
         assert_eq!(
             parse_limit(Some("101"), 25, 100),
-            Err(LimitError::OutsideRange)
+            Err(ValidationError::LimitOutsideRange)
         );
     }
 
     #[test]
     fn rejects_non_get_requests() {
-        let request = Request::builder()
-            .method(Method::POST)
-            .body(Body::Empty)
-            .expect("valid request");
+        let mut request = Request::new(Body::Empty);
+        *request.method_mut() = Method::POST;
 
-        let response = validate_get(&request, 25, 100).expect_err("POST must be rejected");
-        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            validate_get(&request, 25, 100),
+            Err(ValidationError::MethodNotAllowed)
+        );
     }
 }

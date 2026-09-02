@@ -8,7 +8,7 @@ const EVENT_KIND: &str = "occupancy.report";
 async fn function_handler(request: Request) -> Result<Response<Body>, Error> {
     let bounds = match validate_get(&request, 24, 250) {
         Ok(bounds) => bounds,
-        Err(response) => return Ok(response),
+        Err(error) => return Ok(error.into_response()),
     };
 
     if !valid_kind(EVENT_KIND) {
@@ -53,14 +53,10 @@ async fn main() -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lambda_http::http::Method;
 
     #[tokio::test]
     async fn renders_the_shared_product_contract() {
-        let request = Request::builder()
-            .method(Method::GET)
-            .body(Body::Empty)
-            .expect("valid request");
+        let request = Request::new(Body::Empty);
 
         let response = function_handler(request).await.expect("handler succeeds");
         assert_eq!(response.status(), StatusCode::OK);
