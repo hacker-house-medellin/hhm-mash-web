@@ -1,0 +1,110 @@
+name: Rust Lambda artifacts
+
+on:
+  pull_request:
+    paths:
+      - "src/lambdas/**"
+      - ".github/workflows/lambda-build.yml"
+  push:
+    branches: ["main"]
+    paths:
+      - "src/lambdas/**"
+      - ".github/workflows/lambda-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lambda-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.97.0 --profile minimal --component clippy,rustfmt
+      - name: Format
+        run: cargo +1.97.0 fmt --manifest-path src/lambdas/Cargo.toml --all -- --check
+      - name: Clippy
+        run: cargo +1.97.0 clippy --manifest-path src/lambdas/Cargo.toml --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo +1.97.0 test --manifest-path src/lambdas/Cargo.toml --all-targets
+
+  package:
+    needs: quality
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture:
+          - name: x86_64
+            platform: amd64
+            file_fragment: "x86-64"
+          - name: arm64
+            platform: arm64
+            file_fragment: "ARM aarch64"
+        binary:
+          - hhm-occupancy-report
+          - hhm-roster-export
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build single-file Lambda artifact
+        run: |
+          set -euo pipefail
+          rm -rf dist package
+          docker buildx build \
+            --file src/lambdas/Dockerfile \
+            --platform "linux/${{ matrix.architecture.platform }}" \
+            --target artifact \
+            --build-arg "LAMBDA_BIN=${{ matrix.binary }}" \
+            --output type=local,dest=dist \
+            src/lambdas
+
+          test "$(find dist -maxdepth 1 -type f -printf '%f\n')" = "bootstrap"
+          test -x dist/bootstrap
+          file dist/bootstrap | tee binary-type.txt
+          grep -F "${{ matrix.architecture.file_fragment }}" binary-type.txt
+
+          mkdir package
+          install -m 0555 dist/bootstrap package/bootstrap
+          (
+            cd package
+            zip -X -9 "../${{ matrix.binary }}-${{ matrix.architecture.name }}.zip" bootstrap
+          )
+          test "$(unzip -Z1 "${{ matrix.binary }}-${{ matrix.architecture.name }}.zip")" = "bootstrap"
+          sha256sum "${{ matrix.binary }}-${{ matrix.architecture.name }}.zip" \
+            > "${{ matrix.binary }}-${{ matrix.architecture.name }}.zip.sha256"
+          stat --printf='bootstrap_bytes=%s\n' dist/bootstrap
+          stat --printf='zip_bytes=%s\n' "${{ matrix.binary }}-${{ matrix.architecture.name }}.zip"
+
+      - name: Build final AWS Lambda OCI image
+        run: |
+          set -euo pipefail
+          image="lambda-smoke:${{ matrix.binary }}-${{ matrix.architecture.name }}"
+          docker buildx build \
+            --file src/lambdas/Dockerfile \
+            --platform "linux/${{ matrix.architecture.platform }}" \
+            --build-arg "LAMBDA_BIN=${{ matrix.binary }}" \
+            --load \
+            --tag "${image}" \
+            src/lambdas
+          test "$(docker image inspect "${image}" --format '{{.Architecture}}')" = "${{ matrix.architecture.platform }}"
+          test "$(docker image inspect "${image}" --format '{{join .Config.Entrypoint " "}}')" = "/var/runtime/bootstrap"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.binary }}-${{ matrix.architecture.name }}
+          path: |
+            ${{ matrix.binary }}-${{ matrix.architecture.name }}.zip
+            ${{ matrix.binary }}-${{ matrix.architecture.name }}.zip.sha256
+            binary-type.txt
+          if-no-files-found: error
+          retention-days: 7
