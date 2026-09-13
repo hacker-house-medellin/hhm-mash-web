@@ -18,7 +18,9 @@ use futures_util::{SinkExt, StreamExt};
 use leptos::prelude::*;
 use leptos::tachys::view::RenderHtml;
 use maud::{DOCTYPE, Markup, html};
-use next_loggers::{JsonObject, Logger, OpenTelemetryTransport, Options, Value as LogValue, json};
+use next_loggers::{
+    Event, JsonObject, Logger, OpenTelemetryTransport, Options, Value as LogValue, json,
+};
 use sea_orm::{Database, DatabaseConnection};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, broadcast};
@@ -108,30 +110,66 @@ impl Observability {
         }
     }
 
-    fn event(&self, name: &'static str, outcome: &'static str) {
-        let fields = JsonObject::from_iter([
-            ("event.name".to_owned(), LogValue::String(name.to_owned())),
-            (
-                "event.outcome".to_owned(),
-                LogValue::String(outcome.to_owned()),
-            ),
-        ]);
-        let _ = self
-            .logger
+    /// Starts a bounded transition event at info severity. Callers attach
+    /// their call-site trace and routine identifiers, then send it.
+    #[must_use = "attach call-site identifiers and call `.send()` to emit the event"]
+    fn event(&self, name: &'static str, outcome: &'static str) -> Event {
+        self.logger
             .info(vec![json!("HHM web transition")])
-            .add_fields(fields)
-            .send();
+            .add_fields(transition_fields(name, outcome))
     }
+
+    /// Same bounded shape as [`Self::event`], at warn severity for rejected
+    /// or ignored transitions.
+    #[must_use = "attach call-site identifiers and call `.send()` to emit the event"]
+    fn warning(&self, name: &'static str, outcome: &'static str) -> Event {
+        self.logger
+            .warn(vec![json!("HHM web transition")])
+            .add_fields(transition_fields(name, outcome))
+    }
+
+    /// Same bounded shape as [`Self::event`], at error severity for failed
+    /// startup or server transitions.
+    #[must_use = "attach call-site identifiers and call `.send()` to emit the event"]
+    fn failure(&self, name: &'static str, outcome: &'static str) -> Event {
+        self.logger
+            .error(vec![json!("HHM web transition")])
+            .add_fields(transition_fields(name, outcome))
+    }
+}
+
+/// Only fixed, low-cardinality names and outcomes are recorded; request
+/// bodies, header values, and connection strings never enter an event.
+fn transition_fields(name: &'static str, outcome: &'static str) -> JsonObject {
+    JsonObject::from_iter([
+        ("event.name".to_owned(), LogValue::String(name.to_owned())),
+        (
+            "event.outcome".to_owned(),
+            LogValue::String(outcome.to_owned()),
+        ),
+    ])
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    const ROUTINE_ID: &str = "ores-routine-EArtKfQP4jNPDFo8WZpmg";
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    let observability = Observability::new();
     let db = match env::var("DATABASE_URL") {
-        Ok(url) if !url.is_empty() => Some(Database::connect(url).await?),
+        Ok(url) if !url.is_empty() => match Database::connect(url).await {
+            Ok(connection) => Some(connection),
+            Err(error) => {
+                let _ = observability
+                    .failure("database.connect", "failed")
+                    .add_trace("ores-trace-sKJAyF6IEddpL4asAdnVE", false)
+                    .add_routine_id(ROUTINE_ID)
+                    .send();
+                return Err(error.into());
+            }
+        },
         _ => None,
     };
     let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".into());
@@ -145,6 +183,11 @@ async fn main() -> anyhow::Result<()> {
             bind_host = %host,
             "ignoring ALLOW_UNAUTHENTICATED_DEMO_WRITES on a non-loopback bind host"
         );
+        let _ = observability
+            .warning("config.demo_writes", "ignored_non_loopback_bind")
+            .add_trace("ores-trace-rOPGXGkAF7YfA4BTgXxs8", false)
+            .add_routine_id(ROUTINE_ID)
+            .send();
     }
     let (events, _) = broadcast::channel(256);
     let state = AppState {
@@ -153,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
         events,
         supabase_url: non_empty_env("SUPABASE_URL"),
         demo_writes_enabled,
-        observability: Observability::new(),
+        observability: observability.clone(),
     };
     let app = Router::new()
         .route("/", get(index))
@@ -174,7 +217,19 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state);
     let port = env::var("PORT").unwrap_or_else(|_| "8081".into());
     let listener = tokio::net::TcpListener::bind(format!("{host}:{port}")).await?;
-    axum::serve(listener, app).await?;
+    let _ = observability
+        .event("server.listen", "ready")
+        .add_trace("ores-trace-s61bML4Oj4qXH0l35h57s", false)
+        .add_routine_id(ROUTINE_ID)
+        .send();
+    if let Err(error) = axum::serve(listener, app).await {
+        let _ = observability
+            .failure("server.serve", "io_error")
+            .add_trace("ores-trace-6S9_bztcRS7NZrMdKUvxZ", false)
+            .add_routine_id(ROUTINE_ID)
+            .send();
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -243,16 +298,24 @@ async fn component_manifest() -> Response {
 }
 
 async fn reservation_component(State(state): State<AppState>) -> Response {
-    state
+    const ROUTINE_ID: &str = "ores-routine-Sdme4Ui_2bcouV_5FsJ0R";
+    let _ = state
         .observability
-        .event("component.reservations", "served");
+        .event("component.reservations", "served")
+        .add_trace("ores-trace-XlTl3nQ1vuvRWmyMLFAn3", false)
+        .add_routine_id(ROUTINE_ID)
+        .send();
     fragment_response(items_markup(&state.items.read().await).into_string())
 }
 
 async fn leptos_capability_component(State(state): State<AppState>) -> Response {
-    state
+    const ROUTINE_ID: &str = "ores-routine-uQyp-hGf2rlGNWNGyLDSq";
+    let _ = state
         .observability
-        .event("component.leptos_capabilities", "served");
+        .event("component.leptos_capabilities", "served")
+        .add_trace("ores-trace-gI5ft48izsDr78qBGs0TM", false)
+        .add_routine_id(ROUTINE_ID)
+        .send();
     fragment_response(leptos_capability_markup())
 }
 
@@ -261,10 +324,14 @@ async fn items_partial(State(state): State<AppState>) -> Response {
 }
 
 async fn create_item(State(state): State<AppState>, Form(input): Form<NewItem>) -> Response {
+    const ROUTINE_ID: &str = "ores-routine-gNBPoWA0WVtXS8V5am-Sn";
     if !state.demo_writes_enabled {
-        state
+        let _ = state
             .observability
-            .event("reservation.demo_create", "denied");
+            .event("reservation.demo_create", "denied")
+            .add_trace("ores-trace-7YjWNUEDf0XAPxuM7qQ4P", false)
+            .add_routine_id(ROUTINE_ID)
+            .send();
         return message_response(
             StatusCode::FORBIDDEN,
             "Demo writes are disabled until authenticated persistence is configured.",
@@ -274,9 +341,12 @@ async fn create_item(State(state): State<AppState>, Form(input): Form<NewItem>) 
     let input = match normalize_item(input) {
         Ok(input) => input,
         Err(_) => {
-            state
+            let _ = state
                 .observability
-                .event("reservation.demo_create", "invalid");
+                .event("reservation.demo_create", "invalid")
+                .add_trace("ores-trace-WXTEStPhgb7Y608Jy4VUE", false)
+                .add_routine_id(ROUTINE_ID)
+                .send();
             return message_response(StatusCode::UNPROCESSABLE_ENTITY, "Invalid reservation.");
         }
     };
@@ -288,9 +358,12 @@ async fn create_item(State(state): State<AppState>, Form(input): Form<NewItem>) 
     };
     let mut items = state.items.write().await;
     if items.len() >= MAX_ITEMS {
-        state
+        let _ = state
             .observability
-            .event("reservation.demo_create", "capacity_reached");
+            .event("reservation.demo_create", "capacity_reached")
+            .add_trace("ores-trace-WAcmATu2VLtsnlkNddNnz", false)
+            .add_routine_id(ROUTINE_ID)
+            .send();
         return message_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "Reservation demo capacity reached.",
@@ -301,9 +374,12 @@ async fn create_item(State(state): State<AppState>, Form(input): Form<NewItem>) 
     drop(items);
 
     let _ = state.events.send(format!("created:{}", item.id));
-    state
+    let _ = state
         .observability
-        .event("reservation.demo_create", "accepted");
+        .event("reservation.demo_create", "accepted")
+        .add_trace("ores-trace-akhFoMwWx3stOclKUQB4l", false)
+        .add_routine_id(ROUTINE_ID)
+        .send();
     fragment_response(rendered)
 }
 
@@ -452,7 +528,16 @@ async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> Response {
+    const ROUTINE_ID: &str = "ores-routine-ubm-XAyqfuOeIQoieqxAx";
     if !websocket_origin_matches_host(&headers) {
+        // Host and Origin header values are caller-controlled, so only the
+        // bounded rejection outcome is recorded.
+        let _ = state
+            .observability
+            .warning("websocket.upgrade", "origin_rejected")
+            .add_trace("ores-trace-Zg0Tr0ch0C9SkXovB8dpN", false)
+            .add_routine_id(ROUTINE_ID)
+            .send();
         let mut response = StatusCode::FORBIDDEN.into_response();
         add_no_store_headers(&mut response);
         return response;
